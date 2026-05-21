@@ -1,36 +1,30 @@
 """
-AI Virtual Mouse — Professional Edition v2
+AI Virtual Mouse — Professional Edition v3
 -------------------------------------------
 Controls:
-  ✦ Move cursor     →  index finger up, others curled (move wrist)
+  ✦ Move cursor     →  index finger only up
   ✦ Scroll          →  index + middle + ring up → move hand up/down
-  ✦ Left click      →  thumb + index pinch  (< 32px)
-  ✦ Right click     →  peace sign (index+middle) held STILL for 0.4s  ← fixed
+  ✦ Left click      →  thumb + index pinch
+  ✦ Right click     →  peace sign (index+middle) held 0.4s
   ✦ Double click    →  all 5 fingers open
-  ✦ Volume          →  thumb + middle only up → spread/close
+  ✦ Volume          →  thumb + middle only → spread/close
   ✦ Screenshot      →  fist (all fingers closed)
   ✦ Quit            →  press  Q
-
-Scroll vs Cursor logic:
-  - index only up  +  vertical delta > SCROLL_LOCK_PX  →  SCROLL mode
-  - index only up  +  hand mostly still                →  CURSOR mode
-  Scroll and cursor are now 100% separate gestures — no overlap possible.
 """
 
 import cv2
 import math
 import time
-import os
 import numpy as np
 import pyautogui
 from pathlib import Path
 from src.hand_tracker import HandTracker
 
-# ── Screenshot save folder ────────────────────────────────────────────────────
+# ── Screenshot folder ────────────────────────────────────────────────────────
 SCREENSHOT_DIR = Path(r"D:\My Pictures\Screenshots")
-SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)   # create if it doesn't exist
+SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Optional Windows volume control ──────────────────────────────────────────
+# ── Volume (Windows only) ────────────────────────────────────────────────────
 try:
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
     from comtypes import CLSCTX_ALL
@@ -42,157 +36,269 @@ try:
 except Exception:
     _vol_ctrl = None
     VOLUME_OK = False
-    print("[--] Volume control unavailable (pycaw / comtypes not installed)")
+    print("[--] Volume control unavailable")
 
 pyautogui.FAILSAFE = True
 pyautogui.PAUSE    = 0.0
 SCREEN_W, SCREEN_H = pyautogui.size()
 
+# ── Display constants ────────────────────────────────────────────────────────
+# Camera feed crops to a clean 4:3 region, then we compose a wider canvas
+# with a side panel — total output is 16:9-ish, good for screen recording.
+CAM_DISPLAY_W  = 640   # webcam preview width  (sharp, big enough for audience)
+CAM_DISPLAY_H  = 480   # webcam preview height
+PANEL_W        = 260   # right side info panel
+CANVAS_W       = CAM_DISPLAY_W + PANEL_W   # 900
+CANVAS_H       = CAM_DISPLAY_H             # 480
+WIN_NAME       = "AI Virtual Mouse  |  Tanjil Sarkar"
+
+# Brand accent colours (BGR)
+C_ACCENT   = (255, 190,  60)   # cyan-gold
+C_BLUE     = (255, 180,  80)   # sky blue
+C_GREEN    = (100, 220,  80)   # lime green
+C_ORANGE   = ( 60, 150, 255)   # orange
+C_WHITE    = (235, 235, 240)
+C_DIM      = (100, 100, 115)
+C_PANEL_BG = ( 18,  20,  28)
+C_BORDER   = ( 55,  58,  75)
+
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║                            HUD Renderer                                 ║
+# ║                         Side-Panel HUD                                  ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-class HUD:
-    PANEL_W = 310
-    PANEL_H = 250
-    MARGIN  = 14
+class SidePanel:
+    """Draws a full-height info panel to the right of the camera feed."""
 
-    GESTURE_ICONS = {
-        "CURSOR"     : "index  Cursor Move",
-        "LEFT CLICK" : "pinch  Left Click",
-        "RIGHT CLICK": "hold   Right Click",
-        "DBL CLICK"  : "open   Double Click",
-        "SCROLL UP"  : "index  Scroll UP",
-        "SCROLL DOWN": "index  Scroll DOWN",
-        "VOLUME"     : "thumb  Volume",
-        "SCREENSHOT" : "fist   Screenshot",
-        "IDLE"       : "--     Idle",
+    GESTURE_META = {
+        # name           : (label,           colour,    symbol)
+        "IDLE"       : ("Idle",           C_DIM,     "  "),
+        "CURSOR"     : ("Cursor Move",    C_BLUE,    "01"),
+        "LEFT CLICK" : ("Left Click",     C_GREEN,   "LC"),
+        "RIGHT CLICK": ("Right Click",    C_ORANGE,  "RC"),
+        "DBL CLICK"  : ("Double Click",   C_ACCENT,  "DC"),
+        "SCROLL UP"  : ("Scroll  UP",     C_BLUE,    "SU"),
+        "SCROLL DOWN": ("Scroll DOWN",    C_BLUE,    "SD"),
+        "VOLUME"     : ("Volume",         C_ACCENT,  "VO"),
+        "SCREENSHOT" : ("Screenshot",     C_GREEN,   "SS"),
     }
 
+    SHORTCUT_ROWS = [
+        ("☝  Index only",   "→ Cursor"),
+        ("☝✌🤘 3 fingers",  "→ Scroll"),
+        ("👌 Pinch",         "→ Left Click"),
+        ("✌  Hold 0.4s",    "→ Right Click"),
+        ("🖐  All open",     "→ Dbl Click"),
+        ("✊  Fist",         "→ Screenshot"),
+        ("🤙 Thumb+Mid",     "→ Volume"),
+    ]
+
     def __init__(self):
-        self.active_gesture   = "IDLE"
-        self.gesture_alpha    = 0.0
-        self.fps_history      = []
-        self.screenshot_count = 0
-        self.volume_pct       = None
-        # right-click hold progress 0.0 → 1.0
-        self.rc_progress      = 0.0
+        self.active     = "IDLE"
+        self.alpha      = 0.0
+        self.fps_hist   = []
+        self.shot_count = 0
+        self.vol_pct    = None
+        self.rc_prog    = 0.0
+        # gesture flash animation
+        self._flash_ts  = 0.0
+        self._flash_col = C_BLUE
 
     def set_gesture(self, name: str):
-        if name != self.active_gesture:
-            self.active_gesture = name
-            self.gesture_alpha  = 0.0
+        if name != self.active:
+            self.active    = name
+            self.alpha     = 0.0
+            self._flash_ts = time.time()
+            _, col, _      = self.GESTURE_META.get(name, ("", C_DIM, ""))
+            self._flash_col = col
 
-    def draw(self, img: np.ndarray, fps: float,
-             vol_pct=None, rc_progress: float = 0.0):
-        h, w, _ = img.shape
-        self.fps_history.append(fps)
-        if len(self.fps_history) > 30:
-            self.fps_history.pop(0)
-        avg_fps = sum(self.fps_history) / len(self.fps_history)
+    def draw(self, canvas: np.ndarray, fps: float,
+             rc_progress: float = 0.0, vol_pct=None):
+
         if vol_pct is not None:
-            self.volume_pct = vol_pct
-        if self.gesture_alpha < 1.0:
-            self.gesture_alpha = min(1.0, self.gesture_alpha + 0.10)
+            self.vol_pct = vol_pct
+        self.alpha    = min(1.0, self.alpha + 0.10)
+        self.rc_prog  = rc_progress
 
-        # ── Glass panel ──────────────────────────────────────────────────────
-        px = w - self.PANEL_W - self.MARGIN
-        py = self.MARGIN
-        panel = img[py:py+self.PANEL_H, px:px+self.PANEL_W]
-        glass = np.zeros_like(panel); glass[:] = (20, 20, 30)
-        cv2.addWeighted(glass, 0.72, panel, 0.28, 0, panel)
-        img[py:py+self.PANEL_H, px:px+self.PANEL_W] = panel
+        self.fps_hist.append(fps)
+        if len(self.fps_hist) > 45:
+            self.fps_hist.pop(0)
+        avg_fps = sum(self.fps_hist) / len(self.fps_hist)
 
-        cv2.rectangle(img, (px,py), (px+self.PANEL_W, py+self.PANEL_H),
-                      (60,60,80), 1, cv2.LINE_AA)
-        cv2.line(img, (px, py+1), (px+self.PANEL_W, py+1),
-                 (100,180,255), 2, cv2.LINE_AA)
+        # ── Panel background ─────────────────────────────────────────────────
+        px = CAM_DISPLAY_W
+        panel = canvas[:, px:]
+        panel[:] = C_PANEL_BG
 
-        # Title
-        cv2.putText(img, "AI VIRTUAL MOUSE",
-                    (px+12, py+24), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.52, (100,200,255), 1, cv2.LINE_AA)
+        W = PANEL_W
+        x0 = px + 16
+
+        # ── Top accent bar ───────────────────────────────────────────────────
+        cv2.rectangle(canvas, (px, 0), (px + W, 3), C_ACCENT, -1)
+
+        # ── Title ────────────────────────────────────────────────────────────
+        cv2.putText(canvas, "AI VIRTUAL MOUSE",
+                    (x0, 26), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.58, C_ACCENT, 2, cv2.LINE_AA)
+        cv2.putText(canvas, "by Tanjil Sarkar",
+                    (x0, 44), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.36, C_DIM, 1, cv2.LINE_AA)
+
+        # ── Divider ──────────────────────────────────────────────────────────
+        def divider(y, col=C_BORDER):
+            cv2.line(canvas, (px+8, y), (px+W-8, y), col, 1)
+
+        divider(54)
+
+        # ── FPS ──────────────────────────────────────────────────────────────
+        fps_col = C_GREEN if avg_fps >= 25 else C_ORANGE
+        cv2.putText(canvas, f"FPS", (x0, 72),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, C_DIM, 1, cv2.LINE_AA)
+        cv2.putText(canvas, f"{avg_fps:5.1f}",
+                    (x0 + 36, 72), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.48, fps_col, 2, cv2.LINE_AA)
 
         # FPS bar
-        bx, by = px+12, py+36
-        bw = self.PANEL_W - 24
-        cv2.rectangle(img,(bx,by),(bx+bw,by+6),(40,40,60),-1)
-        col = (0,220,120) if avg_fps >= 25 else (0,140,255)
-        cv2.rectangle(img,(bx,by),(bx+int(bw*min(avg_fps/60,1)),by+6),
-                      col,-1,cv2.LINE_AA)
-        cv2.putText(img, f"FPS  {avg_fps:4.1f}",
-                    (bx, by-3), cv2.FONT_HERSHEY_SIMPLEX,
-                    0.40, (160,160,180), 1, cv2.LINE_AA)
+        bx, by, bw, bh = x0, 78, W - 32, 5
+        cv2.rectangle(canvas, (bx, by), (bx+bw, by+bh), (35,38,50), -1)
+        fill = int(bw * min(avg_fps / 60.0, 1.0))
+        cv2.rectangle(canvas, (bx, by), (bx+fill, by+bh), fps_col, -1)
 
-        # Active gesture
-        ga    = self.gesture_alpha
-        gest  = self.GESTURE_ICONS.get(self.active_gesture, self.active_gesture)
-        gcol  = tuple(int(c*ga) for c in (60,220,255))
-        cv2.putText(img, gest, (px+12, py+74),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.58, gcol, 2, cv2.LINE_AA)
+        divider(93)
 
-        # Right-click hold arc
+        # ── Active gesture block ──────────────────────────────────────────────
+        label, gcol, sym = self.GESTURE_META.get(
+            self.active, ("Unknown", C_DIM, "??"))
+
+        # Flash border when gesture changes
+        flash_age = time.time() - self._flash_ts
+        if flash_age < 0.35:
+            flash_alpha = 1.0 - flash_age / 0.35
+            brd_col = tuple(int(c * flash_alpha) for c in self._flash_col)
+            cv2.rectangle(canvas, (px+8, 98), (px+W-8, 148), brd_col, 2)
+
+        # Gesture symbol badge
+        cv2.rectangle(canvas, (x0, 101), (x0+38, 143), (30,33,45), -1)
+        cv2.rectangle(canvas, (x0, 101), (x0+38, 143), gcol, 1)
+        cv2.putText(canvas, sym, (x0+4, 132),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72,
+                    tuple(int(c * self.alpha) for c in gcol),
+                    2, cv2.LINE_AA)
+
+        # Gesture label
+        cv2.putText(canvas, "GESTURE", (x0+46, 113),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.30, C_DIM, 1, cv2.LINE_AA)
+        gcol_a = tuple(int(c * self.alpha) for c in gcol)
+        cv2.putText(canvas, label, (x0+46, 134),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, gcol_a, 2, cv2.LINE_AA)
+
+        # Right-click charge arc
         if rc_progress > 0.01:
-            cx2, cy2 = px + self.PANEL_W - 30, py + 74
-            angle = int(rc_progress * 360)
-            cv2.ellipse(img,(cx2,cy2),(14,14),
-                        -90, 0, angle, (0,200,255), 3, cv2.LINE_AA)
+            arc_cx = px + W - 28
+            cv2.ellipse(canvas, (arc_cx, 122), (16, 16),
+                        -90, 0, int(rc_progress * 360),
+                        (0, 200, 255), 3, cv2.LINE_AA)
+            cv2.putText(canvas, "HOLD",
+                        (arc_cx - 12, 126),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28,
+                        (0, 200, 255), 1, cv2.LINE_AA)
 
-        cv2.line(img,(px+10,py+88),(px+self.PANEL_W-10,py+88),(50,50,70),1)
+        divider(153)
 
-        # Legend
-        legend = [
-            ("3 fingers up   ", "Scroll Up/Down"),
-            ("Pinch           ", "Left Click"),
-            ("Peace+hold 0.4s ", "Right Click"),
-            ("All open        ", "Dbl Click"),
-            ("Fist            ", "Screenshot"),
-        ]
-        if VOLUME_OK:
-            legend.append(("Thumb+Middle  ", "Volume"))
+        # ── Shortcut legend ───────────────────────────────────────────────────
+        cv2.putText(canvas, "SHORTCUTS", (x0, 167),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, C_DIM, 1, cv2.LINE_AA)
 
-        for i, (key, val) in enumerate(legend):
-            yy = py + 104 + i * 20
-            cv2.putText(img, key, (px+14, yy),
+        rows = self.SHORTCUT_ROWS
+        if not VOLUME_OK:
+            rows = [r for r in rows if "Volume" not in r[1]]
+
+        for i, (gesture, action) in enumerate(rows):
+            y = 184 + i * 36
+            # Highlight the currently active row
+            active_label = self.GESTURE_META.get(self.active, ("","",""))[0]
+            is_active = action.replace("→ ", "") in active_label or \
+                        (self.active in ("SCROLL UP","SCROLL DOWN") and "Scroll" in action)
+            row_col = C_WHITE if is_active else C_DIM
+            row_thick = 2 if is_active else 1
+            if is_active:
+                cv2.rectangle(canvas,
+                              (px+8, y-14), (px+W-8, y+18),
+                              (35, 40, 55), -1)
+            cv2.putText(canvas, gesture, (x0, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.34,
-                        (120,120,150), 1, cv2.LINE_AA)
-            cv2.putText(img, val, (px+160, yy),
+                        row_col, row_thick, cv2.LINE_AA)
+            cv2.putText(canvas, action, (x0, y+14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.34,
-                        (200,200,220), 1, cv2.LINE_AA)
+                        tuple(int(c*0.7) for c in row_col), 1, cv2.LINE_AA)
 
-        # Volume bar
-        if self.volume_pct is not None and VOLUME_OK:
-            vby = py + self.PANEL_H - 20
-            vbx = px + 12
-            vbw = self.PANEL_W - 24
-            cv2.rectangle(img,(vbx,vby),(vbx+vbw,vby+8),(40,40,60),-1)
-            cv2.rectangle(img,(vbx,vby),
-                          (vbx+int(vbw*self.volume_pct/100),vby+8),
-                          (80,180,255),-1,cv2.LINE_AA)
-            cv2.putText(img,f"VOL {self.volume_pct}%",(vbx,vby-4),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.38,(130,180,255),1,cv2.LINE_AA)
+        divider(CANVAS_H - 60)
 
-        # Screenshot badge
-        if self.screenshot_count:
-            cv2.putText(img, f"SHOT {self.screenshot_count}", (14,34),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,220,120),2,cv2.LINE_AA)
+        # ── Volume bar ────────────────────────────────────────────────────────
+        if self.vol_pct is not None and VOLUME_OK:
+            vy = CANVAS_H - 44
+            cv2.putText(canvas, f"VOL", (x0, vy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.34, C_DIM, 1, cv2.LINE_AA)
+            cv2.putText(canvas, f"{self.vol_pct}%", (x0+34, vy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, C_BLUE, 2, cv2.LINE_AA)
+            vbx, vby = x0, vy + 6
+            vbw = W - 32
+            cv2.rectangle(canvas, (vbx, vby), (vbx+vbw, vby+6), (35,38,50), -1)
+            fill = int(vbw * self.vol_pct / 100)
+            cv2.rectangle(canvas, (vbx, vby), (vbx+fill, vby+6),
+                          C_BLUE, -1, cv2.LINE_AA)
 
-        # Quit hint
-        cv2.putText(img,"Q  quit",(14,h-14),
-                    cv2.FONT_HERSHEY_SIMPLEX,0.38,(90,90,110),1,cv2.LINE_AA)
+        # ── Screenshot counter ────────────────────────────────────────────────
+        if self.shot_count:
+            sy = CANVAS_H - 18
+            cv2.putText(canvas, f"SHOTS  {self.shot_count:03d}",
+                        (x0, sy), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.38, C_GREEN, 1, cv2.LINE_AA)
+
+        # ── Quit hint ─────────────────────────────────────────────────────────
+        cv2.putText(canvas, "Q  quit",
+                    (px + W - 60, CANVAS_H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, C_DIM, 1, cv2.LINE_AA)
+
+        # ── Left divider line ─────────────────────────────────────────────────
+        cv2.line(canvas, (px, 0), (px, CANVAS_H), C_BORDER, 1)
+
+
+# ── Corner overlay drawn ON the camera feed ──────────────────────────────────
+def draw_cam_overlay(img: np.ndarray, gesture: str, fps: float):
+    """Minimal overlay on the camera feed — corner brackets + gesture pill."""
+    h, w = img.shape[:2]
+    L = 28   # bracket arm length
+    T = 3    # bracket thickness
+    col = (255, 190, 60)
+
+    # Corner brackets
+    for (cx, cy) in [(0,0),(w,0),(0,h),(w,h)]:
+        sx = 1 if cx == 0 else -1
+        sy = 1 if cy == 0 else -1
+        ox, oy = cx + sx*6, cy + sy*6
+        cv2.line(img,(ox,oy),(ox+sx*L,oy), col, T, cv2.LINE_AA)
+        cv2.line(img,(ox,oy),(ox,oy+sy*L), col, T, cv2.LINE_AA)
+
+    # Gesture pill bottom-left
+    if gesture not in ("IDLE",""):
+        label = gesture
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+        rx, ry = 10, h - 14
+        cv2.rectangle(img, (rx-6, ry-th-6), (rx+tw+6, ry+4),
+                      (20, 22, 32), -1)
+        cv2.rectangle(img, (rx-6, ry-th-6), (rx+tw+6, ry+4),
+                      col, 1, cv2.LINE_AA)
+        cv2.putText(img, label, (rx, ry),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, col, 2, cv2.LINE_AA)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║                          Gesture Helpers                                ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def get_finger_states(lm):
-    """[thumb, index, middle, ring, pinky]  1=up  0=down"""
-    tips = [4, 8, 12, 16, 20]
-    pips = [3, 6, 10, 14, 18]
-    out  = []
-    # Thumb: X-axis (mirrored camera)
-    out.append(1 if lm[tips[0]][0] > lm[pips[0]][0] else 0)
-    # Fingers: Y-axis (tip above pip = extended)
+    tips = [4,  8, 12, 16, 20]
+    pips = [3,  6, 10, 14, 18]
+    out  = [1 if lm[tips[0]][0] > lm[pips[0]][0] else 0]
     for i in range(1, 5):
         out.append(1 if lm[tips[i]][1] < lm[pips[i]][1] else 0)
     return out
@@ -202,85 +308,83 @@ def dist(a, b):
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║                             Main Loop                                   ║
+# ║                            Main Loop                                    ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 def main():
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT,  720)
     cap.set(cv2.CAP_PROP_FPS,           60)
+    # Sharper image: disable auto-exposure if supported
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
 
     tracker = HandTracker(max_hands=1, detection_conf=0.78, tracking_conf=0.65)
-    hud     = HUD()
+    panel   = SidePanel()
 
-    # ── Cursor smoothing ─────────────────────────────────────────────────────
+    # Smoothing
     smooth_x, smooth_y = 0.0, 0.0
-    SMOOTH_CURSOR = 0.72   # high = smoother cursor
-    SMOOTH_SCROLL = 0.50   # lower = more responsive scroll
-
+    SMOOTH = 0.72
     CAM_MARGIN_X = 0.10
     CAM_MARGIN_Y = 0.10
 
-    # ── Pinch hysteresis (enter at 30, exit at 42 → no flicker) ─────────────
-    PINCH_ENTER = 30
-    PINCH_EXIT  = 42
-    in_pinch    = False
+    # Pinch hysteresis
+    PINCH_ENTER, PINCH_EXIT = 30, 42
+    in_pinch = False
 
-    # ── Right-click hold timer ───────────────────────────────────────────────
-    RC_HOLD_SEC   = 0.40   # must hold peace sign THIS long to fire
-    rc_hold_start = None   # timestamp when peace sign first seen
-    rc_fired      = False  # did we already fire this hold?
+    # Right-click hold
+    RC_HOLD_SEC   = 0.40
+    rc_hold_start = None
+    rc_fired      = False
 
-    # ── Scroll mode latch ────────────────────────────────────────────────────
-    # Prevents cursor/scroll flip-flop on small tremors
-    SCROLL_LOCK_PX   = 8     # min vertical delta (px) to enter scroll mode
-    SCROLL_LATCH_SEC = 0.25  # stay in scroll mode for at least this long
-    scroll_mode      = False
-    scroll_latch_ts  = 0.0
-    prev_scroll_y    = None
-    SCROLL_SENS      = 0.55
+    # Scroll
+    SCROLL_LOCK_PX = 8
+    SCROLL_SENS    = 0.55
+    prev_scroll_y  = None
 
-    # ── Cooldowns ────────────────────────────────────────────────────────────
+    # Cooldowns
     cd = {k: 0.0 for k in ["click","double","screenshot"]}
-    CD = {"click": 0.30, "double": 0.55, "screenshot": 0.80}
+    CD = {"click":0.30, "double":0.55, "screenshot":0.80}
 
-    # ── Volume ───────────────────────────────────────────────────────────────
+    # Volume
     prev_vol_dist = None
 
     shot_count = 0
     prev_time  = time.time()
-    rc_progress = 0.0
 
-    print("\n[AI Virtual Mouse v2]  Q = quit\n")
-    print(f"[Screenshots] Saving to → {SCREENSHOT_DIR}\n")
-
-    # ── Create preview window and pin to bottom-right corner ─────────────────
-    PREVIEW_W, PREVIEW_H = 480, 270
-    WIN_NAME = "AI Virtual Mouse v2"
+    # ── Window setup ─────────────────────────────────────────────────────────
     cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN_NAME, PREVIEW_W, PREVIEW_H)
-    # Position: bottom-right, 10px from edges
-    win_x = SCREEN_W - PREVIEW_W - 10
-    win_y = SCREEN_H - PREVIEW_H - 50   # 50px offset clears taskbar
+    cv2.resizeWindow(WIN_NAME, CANVAS_W, CANVAS_H)
+    # Pin bottom-right, above taskbar
+    win_x = SCREEN_W - CANVAS_W - 12
+    win_y = SCREEN_H - CANVAS_H - 50
     cv2.moveWindow(WIN_NAME, win_x, win_y)
 
+    print(f"\n[AI Virtual Mouse v3]  Q = quit")
+    print(f"[Screenshots] → {SCREENSHOT_DIR}\n")
+
     while True:
-        ok, img = cap.read()
+        ok, raw = cap.read()
         if not ok:
             break
 
-        img = cv2.flip(img, 1)
+        raw = cv2.flip(raw, 1)
+
         now = time.time()
         dt  = max(now - prev_time, 1e-6)
         fps = 1.0 / dt
         prev_time = now
 
-        # Tick cooldowns
         for k in cd:
             cd[k] = max(0.0, cd[k] - dt)
 
-        img = tracker.find_hands(img, draw=True)
-        lm  = tracker.get_landmarks(img)
+        # ── Sharpen the camera frame ──────────────────────────────────────────
+        # Unsharp mask: adds crisp edges, makes hand more visible on recording
+        blur    = cv2.GaussianBlur(raw, (0, 0), 3)
+        sharp   = cv2.addWeighted(raw, 1.6, blur, -0.6, 0)
+
+        # Run detection on sharp frame
+        proc = tracker.find_hands(sharp.copy(), draw=True)
+        lm   = tracker.get_landmarks(proc)
 
         current_gesture = "IDLE"
         rc_progress     = 0.0
@@ -290,36 +394,30 @@ def main():
             thumb_tip  = lm[4]
             middle_tip = lm[12]
             wrist      = lm[0]
-            cam_h, cam_w, _ = img.shape
+            cam_h, cam_w, _ = proc.shape
 
-            fingers  = get_finger_states(lm)
-            pinch_d  = dist(idx_tip, thumb_tip)
-            mid_d    = dist(middle_tip, thumb_tip)
+            fingers = get_finger_states(lm)
+            pinch_d = dist(idx_tip, thumb_tip)
+            mid_d   = dist(middle_tip, thumb_tip)
 
-            # ── Pinch hysteresis ─────────────────────────────────────────────
+            # Pinch hysteresis
             if in_pinch:
-                if pinch_d > PINCH_EXIT:
-                    in_pinch = False
+                if pinch_d > PINCH_EXIT:  in_pinch = False
             else:
-                if pinch_d < PINCH_ENTER:
-                    in_pinch = True
+                if pinch_d < PINCH_ENTER: in_pinch = True
 
             tracker.add_trail_point(*idx_tip)
 
-            # ══════════════════════════════════════════════════════════════════
-            # PRIORITY 1 — LEFT CLICK  (pinch, any finger config)
-            # ══════════════════════════════════════════════════════════════════
+            # ── Priority 1: LEFT CLICK ────────────────────────────────────────
             if in_pinch and cd["click"] == 0:
                 pyautogui.click()
                 cd["click"] = CD["click"]
-                in_pinch    = False   # reset so next frame isn't instant re-click
+                in_pinch    = False
                 tracker.trigger_ripple(*idx_tip, "LEFT CLICK")
                 current_gesture = "LEFT CLICK"
-                print(f"  ◆ Left Click")
+                print("  ◆ Left Click")
 
-            # ══════════════════════════════════════════════════════════════════
-            # PRIORITY 2 — DOUBLE CLICK  (all 5 open)
-            # ══════════════════════════════════════════════════════════════════
+            # ── Priority 2: DOUBLE CLICK ──────────────────────────────────────
             elif all(f==1 for f in fingers) and cd["double"] == 0:
                 pyautogui.doubleClick()
                 cd["double"] = CD["double"]
@@ -327,12 +425,10 @@ def main():
                 current_gesture = "DBL CLICK"
                 print("  ◆ Double Click")
 
-            # ══════════════════════════════════════════════════════════════════
-            # PRIORITY 3 — SCREENSHOT  (fist)
-            # ══════════════════════════════════════════════════════════════════
+            # ── Priority 3: SCREENSHOT ────────────────────────────────────────
             elif all(f==0 for f in fingers) and cd["screenshot"] == 0:
                 shot_count += 1
-                hud.screenshot_count = shot_count
+                panel.shot_count = shot_count
                 fname = str(SCREENSHOT_DIR / f"screenshot_{shot_count:03d}.png")
                 pyautogui.screenshot(fname)
                 cd["screenshot"] = CD["screenshot"]
@@ -340,9 +436,7 @@ def main():
                 current_gesture = "SCREENSHOT"
                 print(f"  ◆ Screenshot → {fname}")
 
-            # ══════════════════════════════════════════════════════════════════
-            # PRIORITY 4 — VOLUME  (thumb + middle only, index down)
-            # ══════════════════════════════════════════════════════════════════
+            # ── Priority 4: VOLUME ────────────────────────────────────────────
             elif (fingers[0]==1 and fingers[2]==1 and
                   fingers[1]==0 and fingers[3]==0 and VOLUME_OK):
                 current_gesture = "VOLUME"
@@ -352,46 +446,33 @@ def main():
                         cur = _vol_ctrl.GetMasterVolumeLevelScalar()
                         nv  = float(np.clip(cur + delta*0.006, 0.0, 1.0))
                         _vol_ctrl.SetMasterVolumeLevelScalar(nv, None)
-                        hud.volume_pct = int(nv*100)
-                        print(f"  ◆ Volume {hud.volume_pct}%")
+                        panel.vol_pct = int(nv * 100)
+                        print(f"  ◆ Volume {panel.vol_pct}%")
                 prev_vol_dist = mid_d
 
-            # ══════════════════════════════════════════════════════════════════
-            # PRIORITY 5 — RIGHT CLICK  (peace sign held still for RC_HOLD_SEC)
-            # Index + Middle up, Ring + Pinky down, no pinch
-            # ══════════════════════════════════════════════════════════════════
+            # ── Priority 5: RIGHT CLICK ───────────────────────────────────────
             elif (fingers[1]==1 and fingers[2]==1 and
                   fingers[3]==0 and fingers[4]==0 and not in_pinch):
-
                 if rc_hold_start is None:
                     rc_hold_start = now
                     rc_fired      = False
-
                 held = now - rc_hold_start
-                rc_progress = min(held / RC_HOLD_SEC, 1.0)
+                rc_progress     = min(held / RC_HOLD_SEC, 1.0)
                 current_gesture = "RIGHT CLICK"
-
                 if held >= RC_HOLD_SEC and not rc_fired:
                     pyautogui.rightClick()
                     rc_fired = True
                     tracker.trigger_ripple(*idx_tip, "RIGHT CLICK")
                     print("  ◆ Right Click")
-
             else:
-                # Reset right-click hold whenever peace sign breaks
                 rc_hold_start = None
                 rc_fired      = False
                 prev_vol_dist = None
 
-            # ══════════════════════════════════════════════════════════════════
-            # PRIORITY 6 — SCROLL  (index + middle + ring up, pinky down)
-            # Completely separate from cursor — zero conflict
-            # Move hand UP = scroll up,  move hand DOWN = scroll down
-            # ══════════════════════════════════════════════════════════════════
-            if (current_gesture in ("IDLE",) and
+            # ── Priority 6: SCROLL (index+middle+ring up) ─────────────────────
+            if (current_gesture == "IDLE" and
                     fingers[1]==1 and fingers[2]==1 and
                     fingers[3]==1 and fingers[4]==0 and not in_pinch):
-
                 if prev_scroll_y is not None:
                     dy = idx_tip[1] - prev_scroll_y
                     if abs(dy) >= SCROLL_LOCK_PX:
@@ -400,47 +481,48 @@ def main():
                             pyautogui.scroll(scroll_amount)
                     current_gesture = "SCROLL UP" if dy <= 0 else "SCROLL DOWN"
                 else:
-                    current_gesture = "SCROLL UP"   # show label immediately on entry
-
+                    current_gesture = "SCROLL UP"
                 prev_scroll_y = idx_tip[1]
-
             else:
                 prev_scroll_y = None
-                scroll_mode   = False
 
-            # ══════════════════════════════════════════════════════════════════
-            # PRIORITY 7 — CURSOR  (index only up, 100% dedicated)
-            # Middle=0, Ring=0, Pinky=0 — completely distinct from scroll
-            # ══════════════════════════════════════════════════════════════════
-            if (current_gesture in ("IDLE", "CURSOR") and
+            # ── Priority 7: CURSOR (index only) ──────────────────────────────
+            if (current_gesture in ("IDLE","CURSOR") and
                     fingers[1]==1 and fingers[2]==0 and
                     fingers[3]==0 and fingers[4]==0 and not in_pinch):
-
-                # Still move cursor for all other gestures (so cursor doesn't freeze)
-                if current_gesture not in ("LEFT CLICK","RIGHT CLICK",
-                                           "DBL CLICK","SCREENSHOT","VOLUME"):
-                    nx = (idx_tip[0]/cam_w - CAM_MARGIN_X) / (1.0 - 2*CAM_MARGIN_X)
-                    ny = (idx_tip[1]/cam_h - CAM_MARGIN_Y) / (1.0 - 2*CAM_MARGIN_Y)
-                    nx = max(0.0, min(1.0, nx))
-                    ny = max(0.0, min(1.0, ny))
-                    smooth_x = smooth_x * SMOOTH_CURSOR + nx*SCREEN_W * (1.0-SMOOTH_CURSOR)
-                    smooth_y = smooth_y * SMOOTH_CURSOR + ny*SCREEN_H * (1.0-SMOOTH_CURSOR)
-                    pyautogui.moveTo(smooth_x, smooth_y)
+                nx = (idx_tip[0]/cam_w - CAM_MARGIN_X) / (1.0 - 2*CAM_MARGIN_X)
+                ny = (idx_tip[1]/cam_h - CAM_MARGIN_Y) / (1.0 - 2*CAM_MARGIN_Y)
+                nx = max(0.0, min(1.0, nx))
+                ny = max(0.0, min(1.0, ny))
+                smooth_x = smooth_x * SMOOTH + nx*SCREEN_W * (1.0-SMOOTH)
+                smooth_y = smooth_y * SMOOTH + ny*SCREEN_H * (1.0-SMOOTH)
+                pyautogui.moveTo(smooth_x, smooth_y)
+                current_gesture = "CURSOR"
 
         else:
             prev_scroll_y = None
             prev_vol_dist = None
             rc_hold_start = None
-            scroll_mode   = False
 
-        hud.set_gesture(current_gesture)
-        hud.draw(img, fps,
-                 vol_pct=hud.volume_pct if VOLUME_OK else None,
-                 rc_progress=rc_progress)
+        # ── Compose final canvas ──────────────────────────────────────────────
+        # Resize processed frame (with skeleton drawn) to display size
+        cam_display = cv2.resize(proc, (CAM_DISPLAY_W, CAM_DISPLAY_H),
+                                 interpolation=cv2.INTER_LANCZOS4)
 
-        # ── Resize frame to compact preview window ───────────────────────────
-        display = cv2.resize(img, (PREVIEW_W, PREVIEW_H), interpolation=cv2.INTER_LINEAR)
-        cv2.imshow(WIN_NAME, display)
+        # Draw minimal overlay on cam feed
+        draw_cam_overlay(cam_display, current_gesture, fps)
+
+        # Build canvas: cam feed left, panel right
+        canvas = np.zeros((CANVAS_H, CANVAS_W, 3), dtype=np.uint8)
+        canvas[:, :CAM_DISPLAY_W] = cam_display
+
+        # Draw side panel
+        panel.set_gesture(current_gesture)
+        panel.draw(canvas, fps,
+                   rc_progress=rc_progress,
+                   vol_pct=panel.vol_pct if VOLUME_OK else None)
+
+        cv2.imshow(WIN_NAME, canvas)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
